@@ -1,175 +1,155 @@
 #include <Wire.h>
-#include <RTClib.h>
 
-RTC_DS3231 rtc;
+// --- PIN CONFIGURATION ---
+const int buttonPin = 1;        // Mode switch / lock-in button
+const int buzzerPin = A0;       // Alarm and chime audio output
+const int potPin = A1;          // Potentiometer configuration input
 
-// Hardware Pins
-const int buttonPin = 1;       // Mode switch / lock-in button
-const int buzzerPin = A0;      // Alarm and chime audio output
-const int potPin = A1;         // Potentiometer configuration input
+const int digitPins[] = {12, 10, 9, 7};
+const int segmentPins[] = {13, 8, 5, 3, 2, 11, 6, 4};
 
-const int digitPins[] = {12, 10, 9, 7}; 
-const int segmentPins[] = {13, 8, 5, 3, 2, 11, 6, 4}; 
-
-// 7-segment byte patterns for numbers 0-9 (Common Cathode)
+// --- DISPLAY SEGMENT PATTERNS (Common Cathode) ---
 const byte numPatterns[] = {
-  0b11111100, 0b01100000, 0b11011010, 0b11110010, 0b01100110,
-  0b10110110, 0b10111110, 0b11100000, 0b11111110, 0b11110110
+  0b00111111, // 0
+  0b00000110, // 1
+  0b01011011, // 2
+  0b01001111, // 3
+  0b01100110, // 4
+  0b01101101, // 5
+  0b01111101, // 6
+  0b00000111, // 7
+  0b01111111, // 8
+  0b01101111  // 9
 };
 
 int displayBuffer[4] = {0, 0, 0, 0};
 bool showColon = true;
 unsigned long lastBlinkTime = 0;
 
-// System States
+// --- STATE MACHINE ---
 enum Modes { BOOT_SET_HOURS, BOOT_SET_MINUTES, CLOCK_MODE, TIMER_SET, TIMER_COUNTDOWN, ALARM_TRIGGER };
-Modes currentMode; 
+Modes currentMode;
 
-// Time Setting Temp Variables
+// --- TIME & CONFIGURATION VARIABLES ---
 int setupHours = 12;
 int setupMinutes = 0;
 
-// Timer Variables
 unsigned long timerRemainingSeconds = 0;
 unsigned long lastTimerUpdateTime = 0;
 int setMinutes = 0;
 
-// Button Debounce & Press States
+// --- DEBOUNCE SYSTEM ---
 bool lastButtonState = HIGH;
 unsigned long lastDebounceTime = 0;
 const unsigned long debounceDelay = 50;
 
 void setup() {
+  Wire.begin();
+  
+  // Initialize Pins
   pinMode(buttonPin, INPUT_PULLUP);
   pinMode(buzzerPin, OUTPUT);
-  digitalWrite(buzzerPin, LOW);
-
-  // Initialize display pins
+  pinMode(potPin, INPUT);
+  
   for (int i = 0; i < 4; i++) {
     pinMode(digitPins[i], OUTPUT);
-    digitalWrite(digitPins[i], HIGH); 
+    digitalWrite(digitPins[i], HIGH); // Turn off digits (Common Cathode control)
   }
+  
   for (int i = 0; i < 8; i++) {
     pinMode(segmentPins[i], OUTPUT);
     digitalWrite(segmentPins[i], LOW);
   }
 
-  // --- NASA STARTUP CHIME ---
-  // Ascending space frequencies (Hz) played using delay intervals
-  playTone(880, 150);  // Note 1: A5
-  delay(50);
-  playTone(1319, 150); // Note 2: E6
-  delay(50);
-  playTone(1760, 300); // Note 3: A6 (Systems Online!)
-
-  if (!rtc.begin()) {
-    while (1); 
-  }
-  
-  // --- SMART BOOT CHECK ---
-  if (rtc.lostPower()) {
-    currentMode = BOOT_SET_HOURS;
-  } else {
-    currentMode = CLOCK_MODE;
-  }
+  // Boot chime sequence
+  currentMode = BOOT_SET_HOURS;
+  playTone(440, 150);
+  delay(100);
+  playTone(554, 150);
+  delay(100);
+  playTone(659, 300);
 }
 
 void loop() {
   checkButton();
-
+  
   switch (currentMode) {
     case BOOT_SET_HOURS:
       handleBootSetHours();
       break;
-
     case BOOT_SET_MINUTES:
       handleBootSetMinutes();
       break;
-
     case CLOCK_MODE:
       handleClockMode();
       break;
-
     case TIMER_SET:
       handleTimerSetMode();
       break;
-
     case TIMER_COUNTDOWN:
       handleTimerCountdownMode();
       break;
-
     case ALARM_TRIGGER:
       handleAlarmMode();
       break;
   }
-
+  
   refreshDisplay();
 }
 
-// --- AUDIO HELPER FUNCTION ---
-// Generates a square wave frequency for passive/active buzzers safely
 void playTone(int frequency, int durationMs) {
-  long periodMicroseconds = 1000000L / frequency;
-  long elapsedMicroseconds = 0;
-  
-  while (elapsedMicroseconds < durationMs * 1000L) {
+  long period = 1000000L / frequency;
+  long pulse = period / 2;
+  long totalCycles = ((long)durationMs * 1000L) / period;
+  for (long i = 0; i < totalCycles; i++) {
     digitalWrite(buzzerPin, HIGH);
-    delayMicroseconds(periodMicroseconds / 2);
+    delayMicroseconds(pulse);
     digitalWrite(buzzerPin, LOW);
-    delayMicroseconds(periodMicroseconds / 2);
-    elapsedMicroseconds += periodMicroseconds;
+    delayMicroseconds(pulse);
   }
 }
 
-// --- BOOT SETUP HANDLERS ---
-
 void handleBootSetHours() {
-  int potValue = analogRead(potPin);
-  setupHours = map(potValue, 0, 1023, 0, 23); 
-
+  int potVal = analogRead(potPin);
+  setupHours = map(potVal, 0, 1023, 0, 23);
+  
   displayBuffer[0] = setupHours / 10;
   displayBuffer[1] = setupHours % 10;
-  displayBuffer[2] = setupMinutes / 10;
-  displayBuffer[3] = setupMinutes % 10;
-
-  if (millis() - lastBlinkTime >= 250) {
-    showColon = !showColon;
-    lastBlinkTime = millis();
-  }
-  if (!showColon) {
-    displayBuffer[0] = 10; 
-    displayBuffer[1] = 10;
-  }
+  displayBuffer[2] = 10; // Clear digit
+  displayBuffer[3] = 10; // Clear digit
+  showColon = false;
 }
 
 void handleBootSetMinutes() {
-  int potValue = analogRead(potPin);
-  setupMinutes = map(potValue, 0, 1023, 0, 59); 
-
-  displayBuffer[0] = setupHours / 10;
-  displayBuffer[1] = setupHours % 10;
+  int potVal = analogRead(potPin);
+  setupMinutes = map(potVal, 0, 1023, 0, 59);
+  
+  displayBuffer[0] = 10; // Clear digit
+  displayBuffer[1] = 10; // Clear digit
   displayBuffer[2] = setupMinutes / 10;
   displayBuffer[3] = setupMinutes % 10;
-
-  if (millis() - lastBlinkTime >= 250) {
-    showColon = !showColon;
-    lastBlinkTime = millis();
-  }
-  if (!showColon) {
-    displayBuffer[2] = 10; 
-    displayBuffer[3] = 10;
-  }
+  showColon = false;
 }
 
-// --- OPERATIONAL RUN HANDLERS ---
-
 void handleClockMode() {
-  DateTime now = rtc.now();
-  displayBuffer[0] = now.hour() / 10;
-  displayBuffer[1] = now.hour() % 10;
-  displayBuffer[2] = now.minute() / 10;
-  displayBuffer[3] = now.minute() % 10;
-
+  // Pull live data from DS3231 RTC via I2C bus
+  Wire.beginTransmission(0x68);
+  Wire.write(0);
+  Wire.endTransmission();
+  Wire.requestFrom(0x68, 3);
+  
+  byte bcdSeconds = Wire.read();
+  byte bcdMinutes = Wire.read();
+  byte bcdHours = Wire.read();
+  
+  int currentHour = ((bcdHours & 0x20) ? 20 : 0) + ((bcdHours & 0x10) ? 10 : 0) + (bcdHours & 0x0F);
+  int currentMinute = ((bcdMinutes & 0x70) >> 4) * 10 + (bcdMinutes & 0x0F);
+  
+  displayBuffer[0] = currentHour / 10;
+  displayBuffer[1] = currentHour % 10;
+  displayBuffer[2] = currentMinute / 10;
+  displayBuffer[3] = currentMinute % 10;
+  
   if (millis() - lastBlinkTime >= 500) {
     showColon = !showColon;
     lastBlinkTime = millis();
@@ -177,89 +157,92 @@ void handleClockMode() {
 }
 
 void handleTimerSetMode() {
-  showColon = true; 
-  int potValue = analogRead(potPin);
-  setMinutes = map(potValue, 0, 1023, 0, 60);
-
-  displayBuffer[0] = setMinutes / 10;
-  displayBuffer[1] = setMinutes % 10;
-  displayBuffer[2] = 0; 
-  displayBuffer[3] = 0;
+  int potVal = analogRead(potPin);
+  setMinutes = map(potVal, 0, 1023, 0, 60);
+  
+  displayBuffer[0] = 0;
+  displayBuffer[1] = 0;
+  displayBuffer[2] = setMinutes / 10;
+  displayBuffer[3] = setMinutes % 10;
+  showColon = true;
 }
 
 void handleTimerCountdownMode() {
-  unsigned long currentMillis = millis();
-  
-  if (currentMillis - lastTimerUpdateTime >= 1000) {
-    lastTimerUpdateTime = currentMillis;
+  if (millis() - lastTimerUpdateTime >= 1000) {
+    lastTimerUpdateTime = millis();
     if (timerRemainingSeconds > 0) {
       timerRemainingSeconds--;
     } else {
       currentMode = ALARM_TRIGGER;
     }
-    showColon = !showColon;
   }
-
+  
   int displayMin = timerRemainingSeconds / 60;
   int displaySec = timerRemainingSeconds % 60;
-
+  
   displayBuffer[0] = displayMin / 10;
   displayBuffer[1] = displayMin % 10;
   displayBuffer[2] = displaySec / 10;
   displayBuffer[3] = displaySec % 10;
+  showColon = true;
 }
 
 void handleAlarmMode() {
-  displayBuffer[0] = 0; displayBuffer[1] = 0; displayBuffer[2] = 0; displayBuffer[3] = 0;
+  displayBuffer[0] = 0;
+  displayBuffer[1] = 0;
+  displayBuffer[2] = 0;
+  displayBuffer[3] = 0;
+  showColon = true;
   
-  // High pitched alarm signal sequence
   if ((millis() / 250) % 2 == 0) {
-    playTone(2000, 100); 
-    showColon = true;
-  } else {
-    digitalWrite(buzzerPin, LOW);
-    showColon = false;
+    playTone(880, 100);
   }
 }
 
-// --- HARDWARE INTERRUPT & PROCESSING INTERFACE ---
-
 void checkButton() {
-  int reading = digitalRead(buttonPin);
-
+  bool reading = digitalRead(buttonPin);
   if (reading != lastButtonState) {
     lastDebounceTime = millis();
   }
-
+  
   if ((millis() - lastDebounceTime) > debounceDelay) {
     if (reading == LOW && lastButtonState == HIGH) {
-      digitalWrite(buzzerPin, LOW); 
-      
-      // Provide a fast click confirmation sound on button press
-      playTone(1500, 30);
-
+      // Button was pressed, shift states
       if (currentMode == BOOT_SET_HOURS) {
         currentMode = BOOT_SET_MINUTES;
-        showColon = true;
-      } 
-      else if (currentMode == BOOT_SET_MINUTES) {
-        rtc.adjust(DateTime(2026, 1, 1, setupHours, setupMinutes, 0));
+        playTone(554, 100);
+      } else if (currentMode == BOOT_SET_MINUTES) {
+        // Program the final values directly into the DS3231 RTC registers via I2C
+        byte bcdH = ((setupHours / 10) << 4) | (setupHours % 10);
+        byte bcdM = ((setupMinutes / 10) << 4) | (setupMinutes % 10);
+        Wire.beginTransmission(0x68);
+        Wire.write(0); // Start at register 00h (seconds)
+        Wire.write(0); // Reset seconds to 00
+        Wire.write(bcdM);
+        Wire.write(bcdH);
+        Wire.endTransmission();
+        
         currentMode = CLOCK_MODE;
-      } 
-      else if (currentMode == CLOCK_MODE) {
+        playTone(659, 200);
+      } else if (currentMode == CLOCK_MODE) {
         currentMode = TIMER_SET;
-      } 
-      else if (currentMode == TIMER_SET) {
+        playTone(440, 100);
+      } else if (currentMode == TIMER_SET) {
         if (setMinutes > 0) {
-          timerRemainingSeconds = setMinutes * 60UL;
+          timerRemainingSeconds = (unsigned long)setMinutes * 60;
           lastTimerUpdateTime = millis();
           currentMode = TIMER_COUNTDOWN;
+          playTone(880, 200);
         } else {
           currentMode = CLOCK_MODE;
+          playTone(330, 150);
         }
-      } 
-      else if (currentMode == TIMER_COUNTDOWN || currentMode == ALARM_TRIGGER) {
-        currentMode = CLOCK_MODE;
+      } else if (currentMode == TIMER_COUNTDOWN) {
+        currentMode = CLOCK_MODE; // Cancel timer
+        playTone(330, 150);
+      } else if (currentMode == ALARM_TRIGGER) {
+        currentMode = CLOCK_MODE; // Dismiss alarm
+        playTone(440, 150);
       }
     }
   }
@@ -267,623 +250,31 @@ void checkButton() {
 }
 
 void refreshDisplay() {
-  for (int digit = 0; digit < 4; digit++) {
-    for (int seg = 0; seg < 8; seg++) {
-      digitalWrite(segmentPins[seg], LOW);
+  for (int d = 0; d < 4; d++) {
+    // Clear all segment outputs
+    for (int s = 0; s < 8; s++) {
+      digitalWrite(segmentPins[s], LOW);
     }
-
-    if (displayBuffer[digit] == 10) {
-      continue; 
-    }
-
-    digitalWrite(digitPins[digit], LOW);
-
-    byte pattern = numPatterns[displayBuffer[digit]];
-    for (int seg = 0; seg < 7; seg++) {
-      digitalWrite(segmentPins[seg], (pattern >> (7 - seg)) & 0x01);
-    }
-
-    if (digit == 1) {
-      if (currentMode == BOOT_SET_HOURS || currentMode == BOOT_SET_MINUTES) {
-        digitalWrite(segmentPins[7], HIGH); 
-      } else if (showColon) {
-        digitalWrite(segmentPins[7], HIGH); 
-      }
-    }
-
-    delayMicroseconds(2000); 
-    digitalWrite(digitPins[digit], HIGH);
-  }
-}#include <Wire.h>
-#include <RTClib.h>
-
-RTC_DS3231 rtc;
-
-// Hardware Pins
-const int buttonPin = 1;       // Mode switch / lock-in button
-const int buzzerPin = A0;      // Alarm and chime audio output
-const int potPin = A1;         // Potentiometer configuration input
-
-const int digitPins[] = {12, 10, 9, 7}; 
-const int segmentPins[] = {13, 8, 5, 3, 2, 11, 6, 4}; 
-
-// 7-segment byte patterns for numbers 0-9 (Common Cathode)
-const byte numPatterns[] = {
-  0b11111100, 0b01100000, 0b11011010, 0b11110010, 0b01100110,
-  0b10110110, 0b10111110, 0b11100000, 0b11111110, 0b11110110
-};
-
-int displayBuffer[4] = {0, 0, 0, 0};
-bool showColon = true;
-unsigned long lastBlinkTime = 0;
-
-// System States
-enum Modes { BOOT_SET_HOURS, BOOT_SET_MINUTES, CLOCK_MODE, TIMER_SET, TIMER_COUNTDOWN, ALARM_TRIGGER };
-Modes currentMode; 
-
-// Time Setting Temp Variables
-int setupHours = 12;
-int setupMinutes = 0;
-
-// Timer Variables
-unsigned long timerRemainingSeconds = 0;
-unsigned long lastTimerUpdateTime = 0;
-int setMinutes = 0;
-
-// Button Debounce & Press States
-bool lastButtonState = HIGH;
-unsigned long lastDebounceTime = 0;
-const unsigned long debounceDelay = 50;
-
-void setup() {
-  pinMode(buttonPin, INPUT_PULLUP);
-  pinMode(buzzerPin, OUTPUT);
-  digitalWrite(buzzerPin, LOW);
-
-  // Initialize display pins
-  for (int i = 0; i < 4; i++) {
-    pinMode(digitPins[i], OUTPUT);
-    digitalWrite(digitPins[i], HIGH); 
-  }
-  for (int i = 0; i < 8; i++) {
-    pinMode(segmentPins[i], OUTPUT);
-    digitalWrite(segmentPins[i], LOW);
-  }
-
-  // --- NASA STARTUP CHIME ---
-  // Ascending space frequencies (Hz) played using delay intervals
-  playTone(880, 150);  // Note 1: A5
-  delay(50);
-  playTone(1319, 150); // Note 2: E6
-  delay(50);
-  playTone(1760, 300); // Note 3: A6 (Systems Online!)
-
-  if (!rtc.begin()) {
-    while (1); 
-  }
-  
-  // --- SMART BOOT CHECK ---
-  if (rtc.lostPower()) {
-    currentMode = BOOT_SET_HOURS;
-  } else {
-    currentMode = CLOCK_MODE;
-  }
-}
-
-void loop() {
-  checkButton();
-
-  switch (currentMode) {
-    case BOOT_SET_HOURS:
-      handleBootSetHours();
-      break;
-
-    case BOOT_SET_MINUTES:
-      handleBootSetMinutes();
-      break;
-
-    case CLOCK_MODE:
-      handleClockMode();
-      break;
-
-    case TIMER_SET:
-      handleTimerSetMode();
-      break;
-
-    case TIMER_COUNTDOWN:
-      handleTimerCountdownMode();
-      break;
-
-    case ALARM_TRIGGER:
-      handleAlarmMode();
-      break;
-  }
-
-  refreshDisplay();
-}
-
-// --- AUDIO HELPER FUNCTION ---
-// Generates a square wave frequency for passive/active buzzers safely
-void playTone(int frequency, int durationMs) {
-  long periodMicroseconds = 1000000L / frequency;
-  long elapsedMicroseconds = 0;
-  
-  while (elapsedMicroseconds < durationMs * 1000L) {
-    digitalWrite(buzzerPin, HIGH);
-    delayMicroseconds(periodMicroseconds / 2);
-    digitalWrite(buzzerPin, LOW);
-    delayMicroseconds(periodMicroseconds / 2);
-    elapsedMicroseconds += periodMicroseconds;
-  }
-}
-
-// --- BOOT SETUP HANDLERS ---
-
-void handleBootSetHours() {
-  int potValue = analogRead(potPin);
-  setupHours = map(potValue, 0, 1023, 0, 23); 
-
-  displayBuffer[0] = setupHours / 10;
-  displayBuffer[1] = setupHours % 10;
-  displayBuffer[2] = setupMinutes / 10;
-  displayBuffer[3] = setupMinutes % 10;
-
-  if (millis() - lastBlinkTime >= 250) {
-    showColon = !showColon;
-    lastBlinkTime = millis();
-  }
-  if (!showColon) {
-    displayBuffer[0] = 10; 
-    displayBuffer[1] = 10;
-  }
-}
-
-void handleBootSetMinutes() {
-  int potValue = analogRead(potPin);
-  setupMinutes = map(potValue, 0, 1023, 0, 59); 
-
-  displayBuffer[0] = setupHours / 10;
-  displayBuffer[1] = setupHours % 10;
-  displayBuffer[2] = setupMinutes / 10;
-  displayBuffer[3] = setupMinutes % 10;
-
-  if (millis() - lastBlinkTime >= 250) {
-    showColon = !showColon;
-    lastBlinkTime = millis();
-  }
-  if (!showColon) {
-    displayBuffer[2] = 10; 
-    displayBuffer[3] = 10;
-  }
-}
-
-// --- OPERATIONAL RUN HANDLERS ---
-
-void handleClockMode() {
-  DateTime now = rtc.now();
-  displayBuffer[0] = now.hour() / 10;
-  displayBuffer[1] = now.hour() % 10;
-  displayBuffer[2] = now.minute() / 10;
-  displayBuffer[3] = now.minute() % 10;
-
-  if (millis() - lastBlinkTime >= 500) {
-    showColon = !showColon;
-    lastBlinkTime = millis();
-  }
-}
-
-void handleTimerSetMode() {
-  showColon = true; 
-  int potValue = analogRead(potPin);
-  setMinutes = map(potValue, 0, 1023, 0, 60);
-
-  displayBuffer[0] = setMinutes / 10;
-  displayBuffer[1] = setMinutes % 10;
-  displayBuffer[2] = 0; 
-  displayBuffer[3] = 0;
-}
-
-void handleTimerCountdownMode() {
-  unsigned long currentMillis = millis();
-  
-  if (currentMillis - lastTimerUpdateTime >= 1000) {
-    lastTimerUpdateTime = currentMillis;
-    if (timerRemainingSeconds > 0) {
-      timerRemainingSeconds--;
-    } else {
-      currentMode = ALARM_TRIGGER;
-    }
-    showColon = !showColon;
-  }
-
-  int displayMin = timerRemainingSeconds / 60;
-  int displaySec = timerRemainingSeconds % 60;
-
-  displayBuffer[0] = displayMin / 10;
-  displayBuffer[1] = displayMin % 10;
-  displayBuffer[2] = displaySec / 10;
-  displayBuffer[3] = displaySec % 10;
-}
-
-void handleAlarmMode() {
-  displayBuffer[0] = 0; displayBuffer[1] = 0; displayBuffer[2] = 0; displayBuffer[3] = 0;
-  
-  // High pitched alarm signal sequence
-  if ((millis() / 250) % 2 == 0) {
-    playTone(2000, 100); 
-    showColon = true;
-  } else {
-    digitalWrite(buzzerPin, LOW);
-    showColon = false;
-  }
-}
-
-// --- HARDWARE INTERRUPT & PROCESSING INTERFACE ---
-
-void checkButton() {
-  int reading = digitalRead(buttonPin);
-
-  if (reading != lastButtonState) {
-    lastDebounceTime = millis();
-  }
-
-  if ((millis() - lastDebounceTime) > debounceDelay) {
-    if (reading == LOW && lastButtonState == HIGH) {
-      digitalWrite(buzzerPin, LOW); 
-      
-      // Provide a fast click confirmation sound on button press
-      playTone(1500, 30);
-
-      if (currentMode == BOOT_SET_HOURS) {
-        currentMode = BOOT_SET_MINUTES;
-        showColon = true;
-      } 
-      else if (currentMode == BOOT_SET_MINUTES) {
-        rtc.adjust(DateTime(2026, 1, 1, setupHours, setupMinutes, 0));
-        currentMode = CLOCK_MODE;
-      } 
-      else if (currentMode == CLOCK_MODE) {
-        currentMode = TIMER_SET;
-      } 
-      else if (currentMode == TIMER_SET) {
-        if (setMinutes > 0) {
-          timerRemainingSeconds = setMinutes * 60UL;
-          lastTimerUpdateTime = millis();
-          currentMode = TIMER_COUNTDOWN;
-        } else {
-          currentMode = CLOCK_MODE;
+    
+    // Select the active common cathode digit
+    digitalWrite(digitPins[d], LOW);
+    
+    int symbol = displayBuffer[d];
+    if (symbol >= 0 && symbol <= 9) {
+      byte pattern = numPatterns[symbol];
+      for (int s = 0; s < 7; s++) {
+        if (bitRead(pattern, s)) {
+          digitalWrite(segmentPins[s], HIGH);
         }
-      } 
-      else if (currentMode == TIMER_COUNTDOWN || currentMode == ALARM_TRIGGER) {
-        currentMode = CLOCK_MODE;
       }
     }
-  }
-  lastButtonState = reading;
-}
-
-void refreshDisplay() {
-  for (int digit = 0; digit < 4; digit++) {
-    for (int seg = 0; seg < 8; seg++) {
-      digitalWrite(segmentPins[seg], LOW);
+    
+    // Control the center colon marker / decimal point on Digit 2
+    if (d == 1 && showColon) {
+      digitalWrite(segmentPins[7], HIGH);
     }
-
-    if (displayBuffer[digit] == 10) {
-      continue; 
-    }
-
-    digitalWrite(digitPins[digit], LOW);
-
-    byte pattern = numPatterns[displayBuffer[digit]];
-    for (int seg = 0; seg < 7; seg++) {
-      digitalWrite(segmentPins[seg], (pattern >> (7 - seg)) & 0x01);
-    }
-
-    if (digit == 1) {
-      if (currentMode == BOOT_SET_HOURS || currentMode == BOOT_SET_MINUTES) {
-        digitalWrite(segmentPins[7], HIGH); 
-      } else if (showColon) {
-        digitalWrite(segmentPins[7], HIGH); 
-      }
-    }
-
-    delayMicroseconds(2000); 
-    digitalWrite(digitPins[digit], HIGH);
-  }
-}#include <Wire.h>
-#include <RTClib.h>
-
-RTC_DS3231 rtc;
-
-// Hardware Pins
-const int buttonPin = 1;       // Mode switch / lock-in button
-const int buzzerPin = A0;      // Alarm and chime audio output
-const int potPin = A1;         // Potentiometer configuration input
-
-const int digitPins[] = {12, 10, 9, 7}; 
-const int segmentPins[] = {13, 8, 5, 3, 2, 11, 6, 4}; 
-
-// 7-segment byte patterns for numbers 0-9 (Common Cathode)
-const byte numPatterns[] = {
-  0b11111100, 0b01100000, 0b11011010, 0b11110010, 0b01100110,
-  0b10110110, 0b10111110, 0b11100000, 0b11111110, 0b11110110
-};
-
-int displayBuffer[4] = {0, 0, 0, 0};
-bool showColon = true;
-unsigned long lastBlinkTime = 0;
-
-// System States
-enum Modes { BOOT_SET_HOURS, BOOT_SET_MINUTES, CLOCK_MODE, TIMER_SET, TIMER_COUNTDOWN, ALARM_TRIGGER };
-Modes currentMode; 
-
-// Time Setting Temp Variables
-int setupHours = 12;
-int setupMinutes = 0;
-
-// Timer Variables
-unsigned long timerRemainingSeconds = 0;
-unsigned long lastTimerUpdateTime = 0;
-int setMinutes = 0;
-
-// Button Debounce & Press States
-bool lastButtonState = HIGH;
-unsigned long lastDebounceTime = 0;
-const unsigned long debounceDelay = 50;
-
-void setup() {
-  pinMode(buttonPin, INPUT_PULLUP);
-  pinMode(buzzerPin, OUTPUT);
-  digitalWrite(buzzerPin, LOW);
-
-  // Initialize display pins
-  for (int i = 0; i < 4; i++) {
-    pinMode(digitPins[i], OUTPUT);
-    digitalWrite(digitPins[i], HIGH); 
-  }
-  for (int i = 0; i < 8; i++) {
-    pinMode(segmentPins[i], OUTPUT);
-    digitalWrite(segmentPins[i], LOW);
-  }
-
-  // --- NASA STARTUP CHIME ---
-  // Ascending space frequencies (Hz) played using delay intervals
-  playTone(880, 150);  // Note 1: A5
-  delay(50);
-  playTone(1319, 150); // Note 2: E6
-  delay(50);
-  playTone(1760, 300); // Note 3: A6 (Systems Online!)
-
-  if (!rtc.begin()) {
-    while (1); 
-  }
-  
-  // --- SMART BOOT CHECK ---
-  if (rtc.lostPower()) {
-    currentMode = BOOT_SET_HOURS;
-  } else {
-    currentMode = CLOCK_MODE;
-  }
-}
-
-void loop() {
-  checkButton();
-
-  switch (currentMode) {
-    case BOOT_SET_HOURS:
-      handleBootSetHours();
-      break;
-
-    case BOOT_SET_MINUTES:
-      handleBootSetMinutes();
-      break;
-
-    case CLOCK_MODE:
-      handleClockMode();
-      break;
-
-    case TIMER_SET:
-      handleTimerSetMode();
-      break;
-
-    case TIMER_COUNTDOWN:
-      handleTimerCountdownMode();
-      break;
-
-    case ALARM_TRIGGER:
-      handleAlarmMode();
-      break;
-  }
-
-  refreshDisplay();
-}
-
-// --- AUDIO HELPER FUNCTION ---
-// Generates a square wave frequency for passive/active buzzers safely
-void playTone(int frequency, int durationMs) {
-  long periodMicroseconds = 1000000L / frequency;
-  long elapsedMicroseconds = 0;
-  
-  while (elapsedMicroseconds < durationMs * 1000L) {
-    digitalWrite(buzzerPin, HIGH);
-    delayMicroseconds(periodMicroseconds / 2);
-    digitalWrite(buzzerPin, LOW);
-    delayMicroseconds(periodMicroseconds / 2);
-    elapsedMicroseconds += periodMicroseconds;
-  }
-}
-
-// --- BOOT SETUP HANDLERS ---
-
-void handleBootSetHours() {
-  int potValue = analogRead(potPin);
-  setupHours = map(potValue, 0, 1023, 0, 23); 
-
-  displayBuffer[0] = setupHours / 10;
-  displayBuffer[1] = setupHours % 10;
-  displayBuffer[2] = setupMinutes / 10;
-  displayBuffer[3] = setupMinutes % 10;
-
-  if (millis() - lastBlinkTime >= 250) {
-    showColon = !showColon;
-    lastBlinkTime = millis();
-  }
-  if (!showColon) {
-    displayBuffer[0] = 10; 
-    displayBuffer[1] = 10;
-  }
-}
-
-void handleBootSetMinutes() {
-  int potValue = analogRead(potPin);
-  setupMinutes = map(potValue, 0, 1023, 0, 59); 
-
-  displayBuffer[0] = setupHours / 10;
-  displayBuffer[1] = setupHours % 10;
-  displayBuffer[2] = setupMinutes / 10;
-  displayBuffer[3] = setupMinutes % 10;
-
-  if (millis() - lastBlinkTime >= 250) {
-    showColon = !showColon;
-    lastBlinkTime = millis();
-  }
-  if (!showColon) {
-    displayBuffer[2] = 10; 
-    displayBuffer[3] = 10;
-  }
-}
-
-// --- OPERATIONAL RUN HANDLERS ---
-
-void handleClockMode() {
-  DateTime now = rtc.now();
-  displayBuffer[0] = now.hour() / 10;
-  displayBuffer[1] = now.hour() % 10;
-  displayBuffer[2] = now.minute() / 10;
-  displayBuffer[3] = now.minute() % 10;
-
-  if (millis() - lastBlinkTime >= 500) {
-    showColon = !showColon;
-    lastBlinkTime = millis();
-  }
-}
-
-void handleTimerSetMode() {
-  showColon = true; 
-  int potValue = analogRead(potPin);
-  setMinutes = map(potValue, 0, 1023, 0, 60);
-
-  displayBuffer[0] = setMinutes / 10;
-  displayBuffer[1] = setMinutes % 10;
-  displayBuffer[2] = 0; 
-  displayBuffer[3] = 0;
-}
-
-void handleTimerCountdownMode() {
-  unsigned long currentMillis = millis();
-  
-  if (currentMillis - lastTimerUpdateTime >= 1000) {
-    lastTimerUpdateTime = currentMillis;
-    if (timerRemainingSeconds > 0) {
-      timerRemainingSeconds--;
-    } else {
-      currentMode = ALARM_TRIGGER;
-    }
-    showColon = !showColon;
-  }
-
-  int displayMin = timerRemainingSeconds / 60;
-  int displaySec = timerRemainingSeconds % 60;
-
-  displayBuffer[0] = displayMin / 10;
-  displayBuffer[1] = displayMin % 10;
-  displayBuffer[2] = displaySec / 10;
-  displayBuffer[3] = displaySec % 10;
-}
-
-void handleAlarmMode() {
-  displayBuffer[0] = 0; displayBuffer[1] = 0; displayBuffer[2] = 0; displayBuffer[3] = 0;
-  
-  // High pitched alarm signal sequence
-  if ((millis() / 250) % 2 == 0) {
-    playTone(2000, 100); 
-    showColon = true;
-  } else {
-    digitalWrite(buzzerPin, LOW);
-    showColon = false;
-  }
-}
-
-// --- HARDWARE INTERRUPT & PROCESSING INTERFACE ---
-
-void checkButton() {
-  int reading = digitalRead(buttonPin);
-
-  if (reading != lastButtonState) {
-    lastDebounceTime = millis();
-  }
-
-  if ((millis() - lastDebounceTime) > debounceDelay) {
-    if (reading == LOW && lastButtonState == HIGH) {
-      digitalWrite(buzzerPin, LOW); 
-      
-      // Provide a fast click confirmation sound on button press
-      playTone(1500, 30);
-
-      if (currentMode == BOOT_SET_HOURS) {
-        currentMode = BOOT_SET_MINUTES;
-        showColon = true;
-      } 
-      else if (currentMode == BOOT_SET_MINUTES) {
-        rtc.adjust(DateTime(2026, 1, 1, setupHours, setupMinutes, 0));
-        currentMode = CLOCK_MODE;
-      } 
-      else if (currentMode == CLOCK_MODE) {
-        currentMode = TIMER_SET;
-      } 
-      else if (currentMode == TIMER_SET) {
-        if (setMinutes > 0) {
-          timerRemainingSeconds = setMinutes * 60UL;
-          lastTimerUpdateTime = millis();
-          currentMode = TIMER_COUNTDOWN;
-        } else {
-          currentMode = CLOCK_MODE;
-        }
-      } 
-      else if (currentMode == TIMER_COUNTDOWN || currentMode == ALARM_TRIGGER) {
-        currentMode = CLOCK_MODE;
-      }
-    }
-  }
-  lastButtonState = reading;
-}
-
-void refreshDisplay() {
-  for (int digit = 0; digit < 4; digit++) {
-    for (int seg = 0; seg < 8; seg++) {
-      digitalWrite(segmentPins[seg], LOW);
-    }
-
-    if (displayBuffer[digit] == 10) {
-      continue; 
-    }
-
-    digitalWrite(digitPins[digit], LOW);
-
-    byte pattern = numPatterns[displayBuffer[digit]];
-    for (int seg = 0; seg < 7; seg++) {
-      digitalWrite(segmentPins[seg], (pattern >> (7 - seg)) & 0x01);
-    }
-
-    if (digit == 1) {
-      if (currentMode == BOOT_SET_HOURS || currentMode == BOOT_SET_MINUTES) {
-        digitalWrite(segmentPins[7], HIGH); 
-      } else if (showColon) {
-        digitalWrite(segmentPins[7], HIGH); 
-      }
-    }
-
-    delayMicroseconds(2000); 
-    digitalWrite(digitPins[digit], HIGH);
+    
+    delayMicroseconds(2000); // High-frequency multiplex delay interval
+    digitalWrite(digitPins[d], HIGH); // De-select digit
   }
 }
